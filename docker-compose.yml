@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ml-drift-db
+    environment:
+      POSTGRES_USER: mluser
+      POSTGRES_PASSWORD: mlpassword
+      POSTGRES_DB: ml_monitoring
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mluser -d ml_monitoring"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    shm_size: 128mb
+    networks:
+      - ml-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ml-drift-backend
+    environment:
+      DATABASE_URL: postgresql://mluser:mlpassword@postgres:5432/ml_monitoring
+      MODEL_PATH: /app/models
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - model_data:/app/models
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ml-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Monitoring Worker
+  monitoring-worker:
+    build:
+      context: ./monitoring-worker
+      dockerfile: Dockerfile
+    container_name: ml-drift-worker
+    environment:
+      DATABASE_URL: postgresql://mluser:mlpassword@postgres:5432/ml_monitoring
+      MONITORING_INTERVAL: 30
+      DRIFT_WINDOW_HOURS: 1
+    volumes:
+      - ./monitoring-worker:/app
+      - model_data:/app/models
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Traffic Simulator
+  traffic-simulator:
+    build:
+      context: ./traffic-simulator
+      dockerfile: Dockerfile
+    container_name: ml-drift-simulator
+    environment:
+      BACKEND_URL: http://backend:8000
+      DEFAULT_RPS: 10
+    volumes:
+      - ./traffic-simulator:/app
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ml-drift-frontend
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_WS_URL: ws://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - ml-network
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
+  model_data:
+
+networks:
+  ml-network:
+    driver: bridge
+
